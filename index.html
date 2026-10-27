@@ -12,6 +12,8 @@
     </script>
     <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js">
     </script>
+
+    <!-- Firebase (compat SDK - serasi dengan skrip biasa, tiada keperluan type=module) -->
     <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-auth-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore-compat.js"></script>
@@ -773,6 +775,10 @@ let adminSessionUnlocked = false;
 const ADMIN_REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 jam sebelum tamat
 const ADMIN_REMINDER_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // popup setiap 1 jam
 // ===== STORAGE ENGINE: FIREBASE FIRESTORE =====
+let cloudHydrated = false;
+let saveTimer = null;
+
+// ===== FIREBASE (SUMBER DATA KONGSI ANTARA PERANTI) =====
 const firebaseConfig = {
     apiKey: "AIzaSyDq5mhhvax-L1N2-g_zNKA6BLy_Z4jw6g4",
     authDomain: "edutrack-lutfi.firebaseapp.com",
@@ -784,50 +790,92 @@ const firebaseConfig = {
 };
 const FIRESTORE_COLLECTION = "edutrack_shared";
 const FIRESTORE_DOC_ID = "main_state_v1";
-const LEGACY_STORAGE_KEYS = ["et_state_v1", "et_allData", "et_subjects", "et_classes", "et_years", "et_currentYear", "et_weeks", "et_bookMonths", "et_pbd", "et_dskp", "et_itemConfig", "et_completedExams", "et_examNamesCustom", "et_adminLock"];
-let cloudHydrated = false;
-let saveTimer = null;
+const LEGACY_STORAGE_KEYS = [
+    "et_state_v1",
+    "et_allData",
+    "et_subjects",
+    "et_classes",
+    "et_years",
+    "et_currentYear",
+    "et_weeks",
+    "et_bookMonths",
+    "et_pbd",
+    "et_dskp",
+    "et_itemConfig",
+    "et_completedExams",
+    "et_examNamesCustom",
+    "et_adminLock"
+];
 let firestoreDb = null;
 let firestoreDocRef = null;
-let firebaseReady = false;
 let firebaseAuthReady = false;
 let firebaseAuthPromise = null;
+let firebaseReady = false;
 let firestoreUnsubscribe = null;
 let isApplyingRemoteState = false;
 let lastPayloadHash = "";
 
+// ID unik setiap peranti/pelayar - digunakan untuk elak gelung kemaskini (self-update loop)
+function getDeviceId() {
+    try {
+        let id = sessionStorage.getItem("et_device_id");
+        if (!id) {
+            id = "dev_" + Math.random().toString(36).slice(2) + "_" + Date.now().toString(36);
+            sessionStorage.setItem("et_device_id", id);
+        }
+        return id;
+    } catch (err) {
+        return "dev_" + Math.random().toString(36).slice(2);
+    }
+}
+const DEVICE_ID = getDeviceId();
+
 function initFirebase() {
     try {
-        if (typeof firebase === "undefined") throw new Error("Firebase SDK tidak tersedia");
+        if (typeof firebase === "undefined") {
+            console.warn("SDK Firebase tidak dapat dimuatkan. Data cloud tidak tersedia.");
+            return;
+        }
         let app = firebase.apps.length ? firebase.app() : firebase.initializeApp(firebaseConfig);
         firestoreDb = app.firestore();
         firestoreDocRef = firestoreDb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC_ID);
         firebaseReady = true;
     } catch (err) {
         console.error("Gagal initialize Firebase:", err);
+        firebaseReady = false;
     }
 }
+initFirebase();
 
 function signInFirebaseAnonymously() {
     if (!firebaseReady || !firebase.auth) return Promise.resolve(false);
     if (firebaseAuthReady) return Promise.resolve(true);
     if (!firebaseAuthPromise) {
         firebaseAuthPromise = firebase.auth().signInAnonymously()
-            .then(() => { firebaseAuthReady = true; return true; })
-            .catch(err => { console.error("Gagal login Firebase Auth anonim:", err); return false; });
+            .then(() => {
+                firebaseAuthReady = true;
+                return true;
+            })
+            .catch(err => {
+                console.error("Gagal login Firebase Auth anonim:", err);
+                firebaseAuthReady = false;
+                return false;
+            });
     }
     return firebaseAuthPromise;
 }
 
+// Dengar perubahan data secara realtime dari peranti lain, dan terus kemaskini paparan
 function setupFirestoreRealtimeListener() {
     if (!firebaseReady || !firestoreDocRef || firestoreUnsubscribe) return;
-    firestoreUnsubscribe = firestoreDocRef.onSnapshot(snap => {
-        if (!snap.exists || !snap.data()?.payload) return;
-        let incomingPayload = snap.data().payload;
-        let incomingHash = JSON.stringify(incomingPayload);
+    firestoreUnsubscribe = firestoreDocRef.onSnapshot((snap) => {
+        if (!snap.exists) return;
+        let val = snap.data();
+        if (!val || !val.payload || val.updatedBy === DEVICE_ID) return;
+        let incomingHash = JSON.stringify(val.payload);
         if (incomingHash === lastPayloadHash) return;
         isApplyingRemoteState = true;
-        applyStatePayload(incomingPayload);
+        applyStatePayload(val.payload);
         migrateAllDataKeysByYear();
         lastPayloadHash = incomingHash;
         isApplyingRemoteState = false;
@@ -836,10 +884,10 @@ function setupFirestoreRealtimeListener() {
         if (typeof renderCurrentPage === "function") renderCurrentPage();
         if (typeof applyAdminSettingsUI === "function") applyAdminSettingsUI();
         if (typeof setSystemControlsLocked === "function") setSystemControlsLocked();
-    }, err => console.error("Ralat realtime listener Firestore:", err));
+    }, (err) => {
+        console.error("Ralat realtime listener Firestore:", err);
+    });
 }
-
-initFirebase();
 
 // Fungsi untuk dapatkan peperiksaan yang telah dijalankan sahaja
 function getCompletedExams() {
@@ -1211,7 +1259,7 @@ function lihatPemetaanExam() {
             let allDataLegacy = safeParseJSON(localStorage.getItem("et_allData"), null);
             if (!allDataLegacy || typeof allDataLegacy !== "object") return null;
             return {
-                allData: allDataLegacy,
+                allData: allDataLegacy || {},
                 allSubjects: safeParseJSON(localStorage.getItem("et_subjects"), ["Bahasa Melayu", "Bahasa Inggeris", "Matematik", "Sains", "Sejarah"]),
                 allClasses: safeParseJSON(localStorage.getItem("et_classes"), ["3 IBNU SINAR", "5 IBNU SINA", "5 IBNU HAYYAN"]),
                 allYears: safeParseJSON(localStorage.getItem("et_years"), [String(new Date().getFullYear())]),
@@ -1229,11 +1277,15 @@ function lihatPemetaanExam() {
 
         function clearLegacyLocalState() {
             if (typeof localStorage === "undefined") return;
-            LEGACY_STORAGE_KEYS.forEach(key => { try { localStorage.removeItem(key); } catch (err) {} });
+            LEGACY_STORAGE_KEYS.forEach(key => {
+                try { localStorage.removeItem(key); } catch (err) {}
+            });
         }
 
         async function loadState() {
-            if (!firebaseReady || !firestoreDocRef || !(await signInFirebaseAnonymously())) return null;
+            if (!firebaseReady || !firestoreDocRef) return null;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return null;
             let snap = await firestoreDocRef.get();
             if (snap.exists && snap.data()?.payload) {
                 clearLegacyLocalState();
@@ -1241,19 +1293,23 @@ function lihatPemetaanExam() {
             }
             let legacyPayload = readLegacyLocalState();
             if (legacyPayload) {
-                await persistState(legacyPayload);
+                await persistState(legacyPayload, true);
                 clearLegacyLocalState();
+                return legacyPayload;
             }
-            return legacyPayload;
+            return null;
         }
 
-        async function persistState(payload) {
-            if (!firebaseReady || !firestoreDocRef || !payload || !(await signInFirebaseAnonymously())) return;
+        async function persistState(payload, immediate) {
+            if (!firebaseReady || !firestoreDocRef || !payload) return;
+            let signedIn = await signInFirebaseAnonymously();
+            if (!signedIn) return;
             try {
                 lastPayloadHash = JSON.stringify(payload);
                 await firestoreDocRef.set({
                     payload: payload,
                     schemaVersion: 1,
+                    updatedBy: DEVICE_ID,
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
             } catch (err) {
@@ -1283,7 +1339,7 @@ function lihatPemetaanExam() {
             let payload = buildStatePayload();
             let payloadHash = JSON.stringify(payload);
             if (payloadHash === lastPayloadHash) return;
-            let saveNow = () => { persistState(payload); };
+            let saveNow = () => { persistState(payload, immediate); };
             if (saveTimer) {
                 clearTimeout(saveTimer);
                 saveTimer = null;
@@ -6018,7 +6074,7 @@ let pelajarWithAvg = st.map(s => {
             document.getElementById("sidebarOverlay").classList.remove("show");
         }
         function computeAndApplyViewMode(){
-            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
             let isMobile;
             if (saved === "mobile") isMobile = true;
             else if (saved === "desktop") isMobile = false;
@@ -6032,11 +6088,11 @@ let pelajarWithAvg = st.map(s => {
             });
         }
         function setViewMode(mode){
-            sessionStorage.setItem("eduTrackViewMode", mode);
+            localStorage.setItem("eduTrackViewMode", mode);
             computeAndApplyViewMode();
         }
         window.addEventListener("resize", ()=>{
-            let saved = sessionStorage.getItem("eduTrackViewMode") || "auto";
+            let saved = localStorage.getItem("eduTrackViewMode") || "auto";
             if (saved === "auto") computeAndApplyViewMode();
         });
         document.addEventListener("DOMContentLoaded", computeAndApplyViewMode);
