@@ -847,6 +847,41 @@ function initFirebase() {
 }
 initFirebase();
 
+// ===== PENUNJUK STATUS SAMBUNGAN CLOUD (supaya ralat tidak senyap) =====
+function firebaseErrorMessage(err) {
+    let code = (err && err.code) ? String(err.code) : "";
+    if (code.includes("operation-not-allowed") || code.includes("admin-restricted")) return "Anonymous Sign-in belum dihidupkan (Firebase Console > Authentication > Sign-in method > Anonymous).";
+    if (code.includes("permission-denied")) return "Firestore Rules menyekat akses (Firebase Console > Firestore > Rules).";
+    if (code.includes("unavailable") || code.includes("network")) return "Tiada sambungan internet / Firestore tidak dapat dihubungi.";
+    if (code.includes("not-found") || code.includes("failed-precondition")) return "Firestore Database belum dicipta (Firebase Console > Firestore Database > Create database).";
+    if (code.includes("unauthorized-domain")) return "Domain ini belum dibenarkan (Authentication > Settings > Authorized domains).";
+    if (code.includes("api-key") || code.includes("invalid-api-key")) return "API key Firebase tidak sah.";
+    return (code || "ralat") + (err && err.message ? " - " + err.message : "");
+}
+function setSyncStatus(state, detail) {
+    try {
+        let el = document.getElementById("cloudSyncBadge");
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "cloudSyncBadge";
+            el.style.cssText = "position:fixed;left:10px;bottom:10px;z-index:99999;padding:6px 12px;border-radius:999px;font:600 12px/1.2 'Plus Jakarta Sans',sans-serif;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);max-width:92vw;";
+            el.onclick = () => { if (el.dataset.detail) alert(el.dataset.detail); };
+            (document.body || document.documentElement).appendChild(el);
+        }
+        let map = {
+            connecting: ["#f59e0b", "☁️ Menyambung ke cloud..."],
+            ok: ["#16a34a", "☁️ Cloud tersambung"],
+            saving: ["#2563eb", "☁️ Menyimpan..."],
+            error: ["#dc2626", "⚠️ Cloud GAGAL - tekan untuk butiran"]
+        };
+        let m = map[state] || map.connecting;
+        el.style.background = m[0];
+        el.textContent = m[1];
+        el.dataset.detail = detail || "";
+        el.title = detail || "";
+    } catch (e) {}
+}
+
 function signInFirebaseAnonymously() {
     if (!firebaseReady || !firebase.auth) return Promise.resolve(false);
     if (firebaseAuthReady) return Promise.resolve(true);
@@ -859,6 +894,8 @@ function signInFirebaseAnonymously() {
             .catch(err => {
                 console.error("Gagal login Firebase Auth anonim:", err);
                 firebaseAuthReady = false;
+                firebaseAuthPromise = null; // benarkan cuba semula
+                setSyncStatus("error", "Login anonim gagal: " + firebaseErrorMessage(err));
                 return false;
             });
     }
@@ -868,7 +905,9 @@ function signInFirebaseAnonymously() {
 // Dengar perubahan data secara realtime dari peranti lain, dan terus kemaskini paparan
 function setupFirestoreRealtimeListener() {
     if (!firebaseReady || !firestoreDocRef || firestoreUnsubscribe) return;
+    signInFirebaseAnonymously().then(() => {
     firestoreUnsubscribe = firestoreDocRef.onSnapshot((snap) => {
+        setSyncStatus("ok", "Data dikongsi secara masa nyata melalui Firestore.");
         if (!snap.exists) return;
         let val = snap.data();
         if (!val || !val.payload || val.updatedBy === DEVICE_ID) return;
@@ -886,6 +925,9 @@ function setupFirestoreRealtimeListener() {
         if (typeof setSystemControlsLocked === "function") setSystemControlsLocked();
     }, (err) => {
         console.error("Ralat realtime listener Firestore:", err);
+        setSyncStatus("error", firebaseErrorMessage(err));
+        firestoreUnsubscribe = null;
+    });
     });
 }
 
@@ -1283,10 +1325,10 @@ function lihatPemetaanExam() {
         }
 
         async function loadState() {
-            if (!firebaseReady || !firestoreDocRef) return null;
-            let signedIn = await signInFirebaseAnonymously();
-            if (!signedIn) return null;
-            let snap = await firestoreDocRef.get();
+            if (!firebaseReady || !firestoreDocRef) throw new Error("Firebase SDK tidak dapat dimuatkan (semak sambungan internet).");
+            setSyncStatus("connecting");
+            await signInFirebaseAnonymously(); // jika gagal, tetap cuba Firestore (berfungsi jika Rules membenarkan)
+            let snap = await firestoreDocRef.get({ source: "server" });
             if (snap.exists && snap.data()?.payload) {
                 clearLegacyLocalState();
                 return snap.data().payload;
@@ -1302,9 +1344,9 @@ function lihatPemetaanExam() {
 
         async function persistState(payload, immediate) {
             if (!firebaseReady || !firestoreDocRef || !payload) return;
-            let signedIn = await signInFirebaseAnonymously();
-            if (!signedIn) return;
+            await signInFirebaseAnonymously();
             try {
+                setSyncStatus("saving");
                 lastPayloadHash = JSON.stringify(payload);
                 await firestoreDocRef.set({
                     payload: payload,
@@ -1312,11 +1354,15 @@ function lihatPemetaanExam() {
                     updatedBy: DEVICE_ID,
                     updatedAt: firebase.firestore.FieldValue.serverTimestamp()
                 }, { merge: true });
+                setSyncStatus("ok", "Data berjaya disimpan ke Firestore.");
             } catch (err) {
+                lastPayloadHash = "";
                 console.error("Gagal simpan ke Firestore:", err);
+                setSyncStatus("error", "Gagal simpan: " + firebaseErrorMessage(err));
             }
         }
 
+        let cloudRetryTimer = null;
         async function loadCloudState() {
             cloudHydrated = false;
             try {
@@ -1326,10 +1372,24 @@ function lihatPemetaanExam() {
                     migrateAllDataKeysByYear();
                     lastPayloadHash = JSON.stringify(buildStatePayload());
                 }
-            } catch (err) {
-                console.error("Gagal muat data:", err);
-            } finally {
                 cloudHydrated = true;
+                setSyncStatus("ok", "Data dimuat dari Firestore.");
+            } catch (err) {
+                // Penting: JANGAN benarkan simpan sebelum berjaya muat, supaya data cloud tidak ditimpa data kosong.
+                console.error("Gagal muat data:", err);
+                setSyncStatus("error", "Gagal muat data: " + firebaseErrorMessage(err) + "\n\nSistem akan cuba semula setiap 5 saat. Perubahan TIDAK disimpan selagi cloud belum tersambung.");
+                if (!cloudRetryTimer) {
+                    cloudRetryTimer = setTimeout(async () => {
+                        cloudRetryTimer = null;
+                        await loadCloudState();
+                        if (cloudHydrated) {
+                            if (typeof refreshSelectors === "function") refreshSelectors();
+                            if (typeof refreshSettingsSelects === "function") refreshSettingsSelects();
+                            if (typeof renderCurrentPage === "function") renderCurrentPage();
+                        }
+                    }, 5000);
+                }
+            } finally {
                 setupFirestoreRealtimeListener();
             }
         }
