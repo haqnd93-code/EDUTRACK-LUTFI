@@ -13,6 +13,11 @@
     <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js">
     </script>
 
+    <!-- Firebase (compat SDK - serasi dengan skrip biasa, tiada keperluan type=module) -->
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore-compat.js"></script>
+
     <style>
         :root { --primary: #6366f1; --success: #10b981; --warning: #f59e0b; --danger: #ef4444; --bg: #f1f5f9; --text: #1e293b; --border: #e2e8f0; }
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -695,7 +700,7 @@
     </div>
 
     <div class="main-content">
-        <div class="topbar"><div>Selamat Datang, <strong style="color:#6366f1;">Mohamad Nasrulhaq</strong> 👋</div><button class="hamburger-btn" id="hamburgerBtn" style="order:-1;" onclick="bukaSidebarMobile()"><i class="fas fa-bars"></i></button><div style="margin-left:auto;"><button class="btn btn-ghost" onclick="toggleDarkMode()"><i class="fas fa-moon"></i></button></div></div>
+        <div class="topbar"><div>Selamat Datang, <strong style="color:#6366f1;">Lutfi</strong> 👋</div><button class="hamburger-btn" id="hamburgerBtn" style="order:-1;" onclick="bukaSidebarMobile()"><i class="fas fa-bars"></i></button><div style="margin-left:auto;"><button class="btn btn-ghost" onclick="toggleDarkMode()"><i class="fas fa-moon"></i></button></div></div>
         <div class="selector-bar">
             <select id="selectYear" onchange="tukarTahun()" style="background:#ede9fe;border-color:#c4b5fd;color:#5b21b6;font-weight:600;"></select>
             <select id="selectSubject" onchange="tukarPenapis()"></select>
@@ -760,7 +765,7 @@ function getCurrentExamNames() {
         let currentBMEditStudent = null, currentBMEditExam = null;
 // Untuk menyimpan nama peperiksaan tersuai bagi setiap tingkatan
 let examNamesCustom = {}; // format: { "Tingkatan 5": ["UP1", "PPSA", "TOV", "SPM"], "Tingkatan 4": [...], "Tingkatan 3": [...] }
-// Daftar peperiksaan yang telah dijalankan (disimpan secara tempatan)
+// Daftar peperiksaan yang telah dijalankan (disimpan ke Firebase Firestore)
 let completedExams = {}; // format: { "Tingkatan 5": ["UP1", "PPSA"], "Tingkatan 4": ["UP1"], ... }
 let adminSystemLock = { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" };
 const ADMIN_AREA_PASSWORD = "9876";
@@ -769,13 +774,162 @@ const MASTER_LOGIN_PASSWORD = "931014";
 let adminSessionUnlocked = false;
 const ADMIN_REMINDER_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 jam sebelum tamat
 const ADMIN_REMINDER_ALERT_COOLDOWN_MS = 60 * 60 * 1000; // popup setiap 1 jam
-// ===== STORAGE ENGINE (RAW - TIADA PERGABUNGAN CLOUD) =====
-// Data disimpan secara tempatan sahaja (localStorage) buat masa ini.
-// Sediakan fungsi loadAll()/saveAll() di bawah sebagai titik integrasi
-// backend/cloud baharu (contoh: Firebase, Supabase, REST API, dsb).
-const LOCAL_STORAGE_KEY = "et_state_v1";
+// ===== STORAGE ENGINE: FIREBASE FIRESTORE =====
 let cloudHydrated = false;
 let saveTimer = null;
+
+// ===== FIREBASE (SUMBER DATA KONGSI ANTARA PERANTI) =====
+const firebaseConfig = {
+    apiKey: "AIzaSyDq5mhhvax-L1N2-g_zNKA6BLy_Z4jw6g4",
+    authDomain: "edutrack-lutfi.firebaseapp.com",
+    projectId: "edutrack-lutfi",
+    storageBucket: "edutrack-lutfi.firebasestorage.app",
+    messagingSenderId: "726626404405",
+    appId: "1:726626404405:web:de689b253ce853245fc97c",
+    measurementId: "G-EBQZGK2WB1"
+};
+const FIRESTORE_COLLECTION = "edutrack_shared";
+const FIRESTORE_DOC_ID = "main_state_v1";
+const LEGACY_STORAGE_KEYS = [
+    "et_state_v1",
+    "et_allData",
+    "et_subjects",
+    "et_classes",
+    "et_years",
+    "et_currentYear",
+    "et_weeks",
+    "et_bookMonths",
+    "et_pbd",
+    "et_dskp",
+    "et_itemConfig",
+    "et_completedExams",
+    "et_examNamesCustom",
+    "et_adminLock"
+];
+let firestoreDb = null;
+let firestoreDocRef = null;
+let firebaseAuthReady = false;
+let firebaseAuthPromise = null;
+let firebaseReady = false;
+let firestoreUnsubscribe = null;
+let isApplyingRemoteState = false;
+let lastPayloadHash = "";
+
+// ID unik setiap peranti/pelayar - digunakan untuk elak gelung kemaskini (self-update loop)
+function getDeviceId() {
+    try {
+        let id = sessionStorage.getItem("et_device_id");
+        if (!id) {
+            id = "dev_" + Math.random().toString(36).slice(2) + "_" + Date.now().toString(36);
+            sessionStorage.setItem("et_device_id", id);
+        }
+        return id;
+    } catch (err) {
+        return "dev_" + Math.random().toString(36).slice(2);
+    }
+}
+const DEVICE_ID = getDeviceId();
+
+function initFirebase() {
+    try {
+        if (typeof firebase === "undefined") {
+            console.warn("SDK Firebase tidak dapat dimuatkan. Data cloud tidak tersedia.");
+            return;
+        }
+        let app = firebase.apps.length ? firebase.app() : firebase.initializeApp(firebaseConfig);
+        firestoreDb = app.firestore();
+        firestoreDocRef = firestoreDb.collection(FIRESTORE_COLLECTION).doc(FIRESTORE_DOC_ID);
+        firebaseReady = true;
+    } catch (err) {
+        console.error("Gagal initialize Firebase:", err);
+        firebaseReady = false;
+    }
+}
+initFirebase();
+
+// ===== PENUNJUK STATUS SAMBUNGAN CLOUD (supaya ralat tidak senyap) =====
+function firebaseErrorMessage(err) {
+    let code = (err && err.code) ? String(err.code) : "";
+    if (code.includes("operation-not-allowed") || code.includes("admin-restricted")) return "Anonymous Sign-in belum dihidupkan (Firebase Console > Authentication > Sign-in method > Anonymous).";
+    if (code.includes("permission-denied")) return "Firestore Rules menyekat akses (Firebase Console > Firestore > Rules).";
+    if (code.includes("unavailable") || code.includes("network")) return "Tiada sambungan internet / Firestore tidak dapat dihubungi.";
+    if (code.includes("not-found") || code.includes("failed-precondition")) return "Firestore Database belum dicipta (Firebase Console > Firestore Database > Create database).";
+    if (code.includes("unauthorized-domain")) return "Domain ini belum dibenarkan (Authentication > Settings > Authorized domains).";
+    if (code.includes("api-key") || code.includes("invalid-api-key")) return "API key Firebase tidak sah.";
+    return (code || "ralat") + (err && err.message ? " - " + err.message : "");
+}
+function setSyncStatus(state, detail) {
+    try {
+        let el = document.getElementById("cloudSyncBadge");
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "cloudSyncBadge";
+            el.style.cssText = "position:fixed;left:10px;bottom:10px;z-index:99999;padding:6px 12px;border-radius:999px;font:600 12px/1.2 'Plus Jakarta Sans',sans-serif;color:#fff;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.25);max-width:92vw;";
+            el.onclick = () => { if (el.dataset.detail) alert(el.dataset.detail); };
+            (document.body || document.documentElement).appendChild(el);
+        }
+        let map = {
+            connecting: ["#f59e0b", "☁️ Menyambung ke cloud..."],
+            ok: ["#16a34a", "☁️ Cloud tersambung"],
+            saving: ["#2563eb", "☁️ Menyimpan..."],
+            error: ["#dc2626", "⚠️ Cloud GAGAL - tekan untuk butiran"]
+        };
+        let m = map[state] || map.connecting;
+        el.style.background = m[0];
+        el.textContent = m[1];
+        el.dataset.detail = detail || "";
+        el.title = detail || "";
+    } catch (e) {}
+}
+
+function signInFirebaseAnonymously() {
+    if (!firebaseReady || !firebase.auth) return Promise.resolve(false);
+    if (firebaseAuthReady) return Promise.resolve(true);
+    if (!firebaseAuthPromise) {
+        firebaseAuthPromise = firebase.auth().signInAnonymously()
+            .then(() => {
+                firebaseAuthReady = true;
+                return true;
+            })
+            .catch(err => {
+                console.error("Gagal login Firebase Auth anonim:", err);
+                firebaseAuthReady = false;
+                firebaseAuthPromise = null; // benarkan cuba semula
+                setSyncStatus("error", "Login anonim gagal: " + firebaseErrorMessage(err));
+                return false;
+            });
+    }
+    return firebaseAuthPromise;
+}
+
+// Dengar perubahan data secara realtime dari peranti lain, dan terus kemaskini paparan
+function setupFirestoreRealtimeListener() {
+    if (!firebaseReady || !firestoreDocRef || firestoreUnsubscribe) return;
+    signInFirebaseAnonymously().then(() => {
+    firestoreUnsubscribe = firestoreDocRef.onSnapshot((snap) => {
+        setSyncStatus("ok", "Data dikongsi secara masa nyata melalui Firestore.");
+        if (!snap.exists) return;
+        let val = snap.data();
+        if (!val || !val.payload || val.updatedBy === DEVICE_ID) return;
+        let incomingHash = JSON.stringify(val.payload);
+        if (incomingHash === lastPayloadHash) return;
+        isApplyingRemoteState = true;
+        applyStatePayload(val.payload);
+        migrateAllDataKeysByYear();
+        lastPayloadHash = incomingHash;
+        isApplyingRemoteState = false;
+        if (typeof refreshSelectors === "function") refreshSelectors();
+        if (typeof refreshSettingsSelects === "function") refreshSettingsSelects();
+        if (typeof renderCurrentPage === "function") renderCurrentPage();
+        if (typeof applyAdminSettingsUI === "function") applyAdminSettingsUI();
+        if (typeof setSystemControlsLocked === "function") setSystemControlsLocked();
+    }, (err) => {
+        console.error("Ralat realtime listener Firestore:", err);
+        setSyncStatus("error", firebaseErrorMessage(err));
+        firestoreUnsubscribe = null;
+    });
+    });
+}
 
 // Fungsi untuk dapatkan peperiksaan yang telah dijalankan sahaja
 function getCompletedExams() {
@@ -999,7 +1153,7 @@ getCurrentExamNames = function() {
     return originalGetExamNames();
 };
 
-        // Storage: localStorage (raw - sedia untuk pergabungan backend/cloud baharu)
+        // Storage: Firebase Firestore untuk perkongsian data antara peranti.
 // Fungsi untuk mendapatkan gred berdasarkan markah (Gred SPM sebenar)
 function getGredSPM(marks, tingkatan) {
     // Gred SPM hanya untuk Tingkatan 4 dan 5
@@ -1140,33 +1294,75 @@ function lihatPemetaanExam() {
             }
         }
 
-        // ---------------------------------------------------------------
-        // TITIK INTEGRASI BACKEND / CLOUD BAHARU
-        // ---------------------------------------------------------------
-        // Fail ini sengaja "mentah" - hanya menggunakan localStorage pelayar
-        // sebagai storan data. Untuk menyambungkannya semula ke Firebase,
-        // Supabase, REST API sendiri, dsb, ubahsuai 3 fungsi di bawah:
-        //   1. loadState()  -> baca data awal dari backend/cloud pilihan anda
-        //   2. persistState(payload) -> hantar/simpan data ke backend/cloud
-        //   3. (opsyenal) tambah realtime listener yang memanggil
-        //      applyStatePayload(data) + migrateAllDataKeysByYear() +
-        //      renderCurrentPage() apabila ada perubahan dari peranti lain
-        // ---------------------------------------------------------------
-
-        async function loadState() {
+        function readLegacyLocalState() {
             if (typeof localStorage === "undefined") return null;
-            return safeParseJSON(localStorage.getItem(LOCAL_STORAGE_KEY), null);
+            let compactPayload = safeParseJSON(localStorage.getItem("et_state_v1"), null);
+            if (compactPayload && typeof compactPayload === "object") return compactPayload;
+            let allDataLegacy = safeParseJSON(localStorage.getItem("et_allData"), null);
+            if (!allDataLegacy || typeof allDataLegacy !== "object") return null;
+            return {
+                allData: allDataLegacy || {},
+                allSubjects: safeParseJSON(localStorage.getItem("et_subjects"), ["Bahasa Melayu", "Bahasa Inggeris", "Matematik", "Sains", "Sejarah"]),
+                allClasses: safeParseJSON(localStorage.getItem("et_classes"), ["3 IBNU SINAR", "5 IBNU SINA", "5 IBNU HAYYAN"]),
+                allYears: safeParseJSON(localStorage.getItem("et_years"), [String(new Date().getFullYear())]),
+                currentYear: localStorage.getItem("et_currentYear") || String(new Date().getFullYear()),
+                masterWeeks: safeParseJSON(localStorage.getItem("et_weeks"), ["Minggu 1", "Minggu 2", "Minggu 3", "Minggu 4"]),
+                bookMonths: safeParseJSON(localStorage.getItem("et_bookMonths"), {}),
+                pbdData: safeParseJSON(localStorage.getItem("et_pbd"), {}),
+                dskpDatabase: safeParseJSON(localStorage.getItem("et_dskp"), {}),
+                itemConfigGlobal: safeParseJSON(localStorage.getItem("et_itemConfig"), {}),
+                completedExams: safeParseJSON(localStorage.getItem("et_completedExams"), {}),
+                examNamesCustom: safeParseJSON(localStorage.getItem("et_examNamesCustom"), {}),
+                adminSystemLock: safeParseJSON(localStorage.getItem("et_adminLock"), { mode: "manual", enabled: false, untilDate: "", startAt: "", endAt: "" })
+            };
         }
 
-        async function persistState(payload) {
+        function clearLegacyLocalState() {
             if (typeof localStorage === "undefined") return;
+            LEGACY_STORAGE_KEYS.forEach(key => {
+                try { localStorage.removeItem(key); } catch (err) {}
+            });
+        }
+
+        async function loadState() {
+            if (!firebaseReady || !firestoreDocRef) throw new Error("Firebase SDK tidak dapat dimuatkan (semak sambungan internet).");
+            setSyncStatus("connecting");
+            await signInFirebaseAnonymously(); // jika gagal, tetap cuba Firestore (berfungsi jika Rules membenarkan)
+            let snap = await firestoreDocRef.get({ source: "server" });
+            if (snap.exists && snap.data()?.payload) {
+                clearLegacyLocalState();
+                return snap.data().payload;
+            }
+            let legacyPayload = readLegacyLocalState();
+            if (legacyPayload) {
+                await persistState(legacyPayload, true);
+                clearLegacyLocalState();
+                return legacyPayload;
+            }
+            return null;
+        }
+
+        async function persistState(payload, immediate) {
+            if (!firebaseReady || !firestoreDocRef || !payload) return;
+            await signInFirebaseAnonymously();
             try {
-                localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(payload));
+                setSyncStatus("saving");
+                lastPayloadHash = JSON.stringify(payload);
+                await firestoreDocRef.set({
+                    payload: payload,
+                    schemaVersion: 1,
+                    updatedBy: DEVICE_ID,
+                    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                }, { merge: true });
+                setSyncStatus("ok", "Data berjaya disimpan ke Firestore.");
             } catch (err) {
-                console.error("Gagal simpan data:", err);
+                lastPayloadHash = "";
+                console.error("Gagal simpan ke Firestore:", err);
+                setSyncStatus("error", "Gagal simpan: " + firebaseErrorMessage(err));
             }
         }
 
+        let cloudRetryTimer = null;
         async function loadCloudState() {
             cloudHydrated = false;
             try {
@@ -1174,18 +1370,36 @@ function lihatPemetaanExam() {
                 if (saved) {
                     applyStatePayload(saved);
                     migrateAllDataKeysByYear();
+                    lastPayloadHash = JSON.stringify(buildStatePayload());
                 }
-            } catch (err) {
-                console.error("Gagal muat data:", err);
-            } finally {
                 cloudHydrated = true;
+                setSyncStatus("ok", "Data dimuat dari Firestore.");
+            } catch (err) {
+                // Penting: JANGAN benarkan simpan sebelum berjaya muat, supaya data cloud tidak ditimpa data kosong.
+                console.error("Gagal muat data:", err);
+                setSyncStatus("error", "Gagal muat data: " + firebaseErrorMessage(err) + "\n\nSistem akan cuba semula setiap 5 saat. Perubahan TIDAK disimpan selagi cloud belum tersambung.");
+                if (!cloudRetryTimer) {
+                    cloudRetryTimer = setTimeout(async () => {
+                        cloudRetryTimer = null;
+                        await loadCloudState();
+                        if (cloudHydrated) {
+                            if (typeof refreshSelectors === "function") refreshSelectors();
+                            if (typeof refreshSettingsSelects === "function") refreshSettingsSelects();
+                            if (typeof renderCurrentPage === "function") renderCurrentPage();
+                        }
+                    }, 5000);
+                }
+            } finally {
+                setupFirestoreRealtimeListener();
             }
         }
 
         function queueCloudSave(immediate) {
-            if (!cloudHydrated) return;
+            if (!cloudHydrated || isApplyingRemoteState) return;
             let payload = buildStatePayload();
-            let saveNow = () => { persistState(payload); };
+            let payloadHash = JSON.stringify(payload);
+            if (payloadHash === lastPayloadHash) return;
+            let saveNow = () => { persistState(payload, immediate); };
             if (saveTimer) {
                 clearTimeout(saveTimer);
                 saveTimer = null;
@@ -6100,7 +6314,7 @@ let pelajarWithAvg = st.map(s => {
                     setAdminNavVisibility();
                     setSystemControlsLocked();
                     maybeNotifyGuruAdminExpiry();
-                } else if(username === 'HAQHENSEM' && password === '12345') {
+                } else if(username === 'LUTFI' && password === '12345') {
                     currentUser = { role: 'guru', name: username };
                     sessionStorage.setItem('edutrack_user', JSON.stringify(currentUser));
                     document.getElementById('loginOverlay').style.display = 'none';
